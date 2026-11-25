@@ -1,0 +1,1041 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() { return request.auth != null; }
+    function isAdmin() { return isSignedIn() && request.auth.token.admin == true; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+
+    function isValidId(id) { return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function blockDoc(blockerId, blockedId) {
+      return /databases/$(database)/documents/blocks/$(blockerId + '_' + blockedId);
+    }
+    function hasBlockRelationship(uid1, uid2) {
+      return uid1 is string
+        && uid2 is string
+        && uid1 != uid2
+        && (exists(blockDoc(uid1, uid2)) || exists(blockDoc(uid2, uid1)));
+    }
+    function canAccessUser(userId) {
+      return isSignedIn() && (request.auth.uid == userId || isAdmin() || !hasBlockRelationship(request.auth.uid, userId));
+    }
+    function canInteractWithUser(userId) {
+      return isSignedIn() && request.auth.uid != userId && !hasBlockRelationship(request.auth.uid, userId);
+    }
+    function otherParticipant(participants) {
+      return participants[0] == request.auth.uid ? participants[1] : participants[0];
+    }
+    function canAccessRoom(data) {
+      return isSignedIn()
+        && request.auth.uid in data.participants
+        && !hasBlockRelationship(request.auth.uid, otherParticipant(data.participants));
+    }
+    function postDoc(postId) {
+      return /databases/$(database)/documents/posts/$(postId);
+    }
+    function replyDoc(replyId) {
+      return /databases/$(database)/documents/post_replies/$(replyId);
+    }
+    function productDoc(productId) {
+      return /databases/$(database)/documents/products/$(productId);
+    }
+    function canAccessProduct(data) {
+      return isAdmin()
+        || (isSignedIn() && (request.auth.uid == data.sellerId || !hasBlockRelationship(request.auth.uid, data.sellerId)));
+    }
+    function isPublicPost(data) {
+      return data.status == 'approved' && data.get('privacy', 'public') != 'private';
+    }
+    function canAccessPost(data) {
+      return isSignedIn()
+        && (isAdmin()
+          || request.auth.uid == data.authorId
+          || (isPublicPost(data) && !hasBlockRelationship(request.auth.uid, data.authorId)));
+    }
+    function canInteractWithPost(postId) {
+      return postId is string
+        && exists(postDoc(postId))
+        && canAccessPost(get(postDoc(postId)).data)
+        && !hasBlockRelationship(request.auth.uid, get(postDoc(postId)).data.authorId);
+    }
+    function canAccessReply(data) {
+      return isSignedIn()
+        && data.postId is string
+        && exists(postDoc(data.postId))
+        && canAccessPost(get(postDoc(data.postId)).data)
+        && (isAdmin() || request.auth.uid == data.authorId || !hasBlockRelationship(request.auth.uid, data.authorId));
+    }
+    function canReplyToParent(data) {
+      return !data.keys().hasAny(['parentId'])
+        || data.parentId == null
+        || (data.parentId is string
+          && exists(replyDoc(data.parentId))
+          && canAccessReply(get(replyDoc(data.parentId)).data)
+          && !hasBlockRelationship(request.auth.uid, get(replyDoc(data.parentId)).data.authorId));
+    }
+    function canAccessReview(data) {
+      return isSignedIn()
+        && (isAdmin()
+          || data.reviewerId == request.auth.uid
+          || (data.productId is string
+            && exists(productDoc(data.productId))
+            && canAccessProduct(get(productDoc(data.productId)).data)
+            && !hasBlockRelationship(request.auth.uid, data.reviewerId)));
+    }
+    function canAccessFollow(data) {
+      return isSignedIn()
+        && (isAdmin()
+          || request.auth.uid == data.followerId
+          || request.auth.uid == data.followingId
+          || (!hasBlockRelationship(request.auth.uid, data.followerId)
+            && !hasBlockRelationship(request.auth.uid, data.followingId)));
+    }
+
+    // ─── Stories helpers ───────────────────────────────────
+    function storyDoc(storyId) {
+      return /databases/$(database)/documents/stories/$(storyId);
+    }
+    function followEdgeDoc(followerId, followingId) {
+      return /databases/$(database)/documents/follow_edges/$(followerId + '_' + followingId);
+    }
+    // A story is "active" iff not removed and posted within the last 24h.
+    // Expiry is derived from createdAt (kept-forever archive model).
+    function isActiveStory(d) {
+      return d.status == 'active'
+        && d.createdAt is timestamp
+        && d.createdAt > request.time - duration.value(24, 'h');
+    }
+    function isPublicStory(d) {
+      return d.get('privacy', 'public') == 'public';
+    }
+    // Owner always sees own (incl. expired archive). Others need an active story that is
+    // either public, or a followers/closeFriends tier they hold a follow-edge for.
+    function canViewStory(d) {
+      return isSignedIn()
+        && !hasBlockRelationship(request.auth.uid, d.authorId)
+        && (request.auth.uid == d.authorId
+          || (isActiveStory(d)
+            && (isPublicStory(d)
+              || (d.privacy in ['followers', 'closeFriends']
+                && exists(followEdgeDoc(request.auth.uid, d.authorId))))));
+    }
+    function isValidStoryCreate(d, storyId) {
+      return isValidId(storyId)
+        && d.authorId == request.auth.uid
+        && d.keys().hasAll(['authorId', 'authorUsername', 'authorPhotoURL', 'mediaType', 'mediaUrl', 'mediaPath', 'posterUrl', 'posterPath', 'width', 'height', 'layers', 'privacy', 'status', 'createdAt', 'expiresAt'])
+        && d.keys().hasOnly(['authorId', 'authorUsername', 'authorPhotoURL', 'mediaType', 'mediaUrl', 'mediaPath', 'posterUrl', 'posterPath', 'width', 'height', 'durationMs', 'layers', 'privacy', 'status', 'createdAt', 'expiresAt'])
+        && d.mediaType in ['image', 'video']
+        && d.mediaUrl is string && d.mediaUrl.size() > 0 && d.mediaUrl.size() <= 2000
+        && d.mediaPath is string && d.mediaPath.size() > 0 && d.mediaPath.size() <= 500
+        && (d.posterUrl == null || (d.posterUrl is string && d.posterUrl.size() <= 2000))
+        && (d.posterPath == null || (d.posterPath is string && d.posterPath.size() <= 500))
+        && (d.authorPhotoURL == null || (d.authorPhotoURL is string && d.authorPhotoURL.size() <= 2000))
+        && d.authorUsername is string && d.authorUsername.size() <= 100
+        && d.width is number && d.height is number
+        && (!d.keys().hasAny(['durationMs']) || d.durationMs is number)
+        && d.layers is list && d.layers.size() <= 30
+        && d.privacy in ['public', 'followers', 'closeFriends']
+        && d.status == 'active'
+        && d.createdAt == request.time
+        && d.expiresAt is timestamp;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(["name", "email", "school", "verified", "createdAt", "updatedAt"])
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.email is string && data.email.size() > 0 && data.email.size() <= 150
+        && data.school is string && data.school.size() > 0 && data.school.size() <= 100
+        && (!data.keys().hasAny(['city']) || (data.city is string && data.city.size() > 0 && data.city.size() <= 100))
+        && data.verified is bool
+        && (!data.keys().hasAny(['reputation']) || data.reputation is number)
+        && (!data.keys().hasAny(['isAdmin']) || data.isAdmin is bool)
+        && (!data.keys().hasAny(['verificationStatus']) || data.verificationStatus in ['pending', 'approved', 'rejected', 'flagged_manual'])
+        && (!data.keys().hasAny(['verificationRejectionReason']) || (data.verificationRejectionReason == null || data.verificationRejectionReason is string))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        // Cloudinary URLs can be long — allow up to 2000 chars
+        && (!data.keys().hasAny(['profilePicture']) || (data.profilePicture == null || (data.profilePicture is string && data.profilePicture.size() <= 2000)))
+        && (!data.keys().hasAny(['coverPhoto']) || (data.coverPhoto == null || (data.coverPhoto is string && data.coverPhoto.size() <= 2000)))
+        && (!data.keys().hasAny(['idCardUrl']) || (data.idCardUrl == null || (data.idCardUrl is string && data.idCardUrl.size() <= 2000)))
+        && (!data.keys().hasAny(['selfieUrl']) || (data.selfieUrl == null || (data.selfieUrl is string && data.selfieUrl.size() <= 2000)))
+        && (!data.keys().hasAny(['about']) || (data.about == null || (data.about is string && data.about.size() <= 600)))
+        && (!data.keys().hasAny(['anonymousPersonaName']) || (data.anonymousPersonaName == null || data.anonymousPersonaName is string))
+        // Organization fields
+        && (!data.keys().hasAny(['accountType']) || data.accountType in ['student', 'organization'])
+        && (!data.keys().hasAny(['orgName']) || (data.orgName == null || (data.orgName is string && data.orgName.size() <= 200)))
+        && (!data.keys().hasAny(['orgType']) || (data.orgType == null || data.orgType in ['company', 'school', 'coaching', 'ngo', 'other']))
+        && (!data.keys().hasAny(['orgDocumentUrl']) || (data.orgDocumentUrl == null || (data.orgDocumentUrl is string && data.orgDocumentUrl.size() <= 2000)))
+        && (!data.keys().hasAny(['orgWebsite']) || (data.orgWebsite == null || (data.orgWebsite is string && data.orgWebsite.size() <= 500)))
+        && (!data.keys().hasAny(['orgDescription']) || (data.orgDescription == null || (data.orgDescription is string && data.orgDescription.size() <= 600)))
+        // Referral System
+        && (!data.keys().hasAny(['referralCode']) || (data.referralCode == null || data.referralCode is string))
+        && (!data.keys().hasAny(['referredBy']) || (data.referredBy == null || data.referredBy is string))
+        && (!data.keys().hasAny(['referralCount']) || (data.referralCount is number));
+    }
+
+    match /users/{userId} {
+      allow get: if canAccessUser(userId);
+      allow list: if isAdmin();
+      
+      allow create: if isVerified() 
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUser(incoming())
+        && !incoming().keys().hasAny(['searchTokens', 'searchTokensUpdatedAt', 'reviewCount', 'ratingSum', 'reputationUpdatedAt'])
+        && incoming().email == request.auth.token.email
+        && incoming().verified == false
+        && incoming().reputation == 5.0
+        && incoming().isAdmin == false
+        && incoming().verificationStatus == 'pending'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+        
+      allow update: if isSignedIn() && isValidId(userId) && (
+        (incoming().diff(existing()).affectedKeys().hasOnly(['anonymousPersonaName', 'updatedAt'])
+          && request.auth.uid == userId
+          && (!incoming().keys().hasAny(['anonymousPersonaName']) || (incoming().anonymousPersonaName == null || incoming().anonymousPersonaName is string))
+          && incoming().updatedAt == request.time)
+        ||
+        (incoming().diff(existing()).affectedKeys().hasOnly(['username', 'lastUsernameChange', 'name', 'city', 'profilePicture', 'coverPhoto', 'about', 'idCardUrl', 'selfieUrl', 'verificationStatus', 'updatedAt', 'anonymousPersonaName', 'orgName', 'orgWebsite', 'orgDescription', 'referralCode']) 
+          && request.auth.uid == userId
+          && isValidUser(incoming())
+          && (incoming().get('verificationStatus', 'approved') == existing().get('verificationStatus', 'approved') || (existing().get('verificationStatus', 'approved') in ['rejected', 'flagged_manual'] && incoming().get('verificationStatus', 'approved') == 'pending'))
+          && (!incoming().diff(existing()).affectedKeys().hasAny(['referralCode']) || existing().get('referralCode', null) == null)
+          && incoming().updatedAt == request.time)
+        ||
+        (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['verified', 'reputation', 'isAdmin', 'verificationStatus', 'verificationRejectionReason', 'city', 'school', 'updatedAt'])
+          && isValidUser(incoming())
+          && incoming().updatedAt == request.time)
+        ||
+        // Presence heartbeat
+        (request.auth.uid == userId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['online', 'lastSeen'])
+          && incoming().online is bool
+          && incoming().lastSeen == request.time)
+        ||
+        // Chat privacy toggle
+        (request.auth.uid == userId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['chatPrivacy'])
+          && incoming().chatPrivacy is map
+          && incoming().chatPrivacy.keys().hasOnly(['followersOnly'])
+          && incoming().chatPrivacy.followersOnly is bool)
+        );
+
+      allow delete: if isAdmin();
+
+      match /referrals/{referredId} {
+        allow read: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isSignedIn()
+          && request.auth.uid == referredId
+          && incoming().timestamp == request.time;
+      }
+
+      // Private per-user documents (e.g. storySeen ring state). Owner-only.
+      match /private/{docId} {
+        allow read, write: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+
+    function isValidProduct(data) {
+      return data.keys().hasAll(["sellerId", "sellerName", "sellerSchool", "title", "price", "condition", "category", "image", "description", "meetupAvailable", "deliveryAvailable", "status", "createdAt", "updatedAt"])
+        && data.sellerId is string && data.sellerId.size() > 0 && data.sellerId.size() <= 128
+        && data.sellerName is string && data.sellerName.size() > 0 && data.sellerName.size() <= 100
+        && data.sellerSchool is string && data.sellerSchool.size() > 0 && data.sellerSchool.size() <= 100
+        && (!data.keys().hasAny(['city']) || (data.city is string && data.city.size() > 0 && data.city.size() <= 100))
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 100
+        && data.price is number && data.price >= 0
+        && data.condition is string && data.condition in ['Brand New', 'Like New', 'Good', 'Used']
+        && data.category is string && data.category.size() > 0 && data.category.size() <= 50
+        // Cloudinary image URLs can exceed 1000 chars — allow up to 2000
+        && data.image is string && data.image.size() > 0 && data.image.size() <= 2000
+        && (!data.keys().hasAny(['images']) || (data.images is list && data.images.size() > 0 && data.images.size() <= 10))
+        && data.description is string && data.description.size() <= 2000
+        && data.meetupAvailable is bool
+        && data.deliveryAvailable is bool
+        && data.status is string && data.status in ['pending', 'available', 'reserved', 'sold', 'rejected']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (!data.keys().hasAny(['reservedById']) || (data.reservedById == null || (data.reservedById is string && data.reservedById.size() > 0 && data.reservedById.size() <= 128)));
+    }
+
+    match /products/{productId} {
+      allow get: if canAccessProduct(resource.data);
+      // Public marketplace browsing is served by getDiscoveryFeed/searchDiscovery
+      // so block relationships can be filtered server-side.
+      allow list: if isAdmin()
+        || (isSignedIn() && resource.data.sellerId == request.auth.uid);
+      
+      allow create: if isVerified() 
+        && isValidId(productId)
+        && request.auth.uid == incoming().sellerId
+        && isValidProduct(incoming())
+        && !incoming().keys().hasAny(['searchTokens', 'searchTokensUpdatedAt', 'sellerReputation', 'bumpedAt'])
+        && (!incoming().keys().hasAny(['reservedById']))
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+        
+      allow update: if isVerified() && isValidId(productId) && isValidProduct(incoming()) && (
+        // Seller updates product details
+        (request.auth.uid == existing().sellerId 
+          && existing().status in ['pending', 'available']
+          && incoming().status == existing().status
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'price', 'condition', 'category', 'image', 'images', 'description', 'meetupAvailable', 'deliveryAvailable', 'city', 'updatedAt'])
+          && incoming().updatedAt == request.time)
+        ||
+        // Buyer reserves product
+        (existing().status == 'available'
+          && incoming().status == 'reserved'
+          && request.auth.uid != existing().sellerId
+          && canInteractWithUser(existing().sellerId)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reservedById', 'updatedAt'])
+          && incoming().reservedById == request.auth.uid
+          && incoming().updatedAt == request.time)
+        ||
+        // Seller or buyer unreserves
+        (existing().status == 'reserved'
+          && incoming().status == 'available'
+          && (request.auth.uid == existing().sellerId || (request.auth.uid == existing().reservedById && !hasBlockRelationship(request.auth.uid, existing().sellerId)))
+          && incoming().updatedAt == request.time)
+        ||
+        // Seller marks as sold
+        (existing().status == 'reserved'
+          && incoming().status == 'sold'
+          && request.auth.uid == existing().sellerId
+          && incoming().updatedAt == request.time)
+        ||
+        // Admin overrides (including approval)
+        (isAdmin() && incoming().updatedAt == request.time)
+      );
+      
+      allow delete: if isVerified() && isValidId(productId) && (request.auth.uid == existing().sellerId || isAdmin());
+    }
+
+    // === BUY REQUESTS ===
+    function isValidBuyRequest(data) {
+      return data.keys().hasAll(['requesterId', 'requesterName', 'requesterSchool', 'title', 'description', 'category', 'tags', 'status', 'createdAt', 'updatedAt'])
+        && data.requesterId is string && data.requesterId.size() > 0 && data.requesterId.size() <= 128
+        && data.requesterName is string && data.requesterName.size() > 0 && data.requesterName.size() <= 100
+        && data.requesterSchool is string && data.requesterSchool.size() > 0 && data.requesterSchool.size() <= 100
+        && (!data.keys().hasAny(['city']) || (data.city is string && data.city.size() > 0 && data.city.size() <= 100))
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 100
+        && data.description is string && data.description.size() <= 2000
+        && data.category is string && data.category.size() > 0 && data.category.size() <= 50
+        && data.tags is list && data.tags.size() <= 10
+        && data.status is string && data.status in ['active', 'fulfilled', 'closed']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (!data.keys().hasAny(['maxBudget']) || data.maxBudget == null || (data.maxBudget is number && data.maxBudget >= 0 && data.maxBudget <= 100000))
+        && (!data.keys().hasAny(['image']) || data.image == null || (data.image is string && data.image.size() <= 2000))
+        && (!data.keys().hasAny(['requesterProfilePicture']) || data.requesterProfilePicture == null || (data.requesterProfilePicture is string && data.requesterProfilePicture.size() <= 2000));
+    }
+
+    function canAccessBuyRequest(data) {
+      return isAdmin()
+        || (isSignedIn() && (request.auth.uid == data.requesterId || !hasBlockRelationship(request.auth.uid, data.requesterId)));
+    }
+
+    match /buyRequests/{requestId} {
+      allow get: if canAccessBuyRequest(resource.data);
+      // Public browsing is served by getDiscoveryFeed/searchDiscovery server-side
+      allow list: if isAdmin()
+        || (isSignedIn() && resource.data.requesterId == request.auth.uid);
+
+      allow create: if isVerified()
+        && request.auth.uid == incoming().requesterId
+        && isValidBuyRequest(incoming())
+        && !incoming().keys().hasAny(['searchTokens', 'searchTokensUpdatedAt'])
+        && incoming().status == 'active'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerified() && (
+        // Requester updates their own request
+        (request.auth.uid == existing().requesterId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'category', 'tags', 'maxBudget', 'image', 'status', 'updatedAt'])
+          && incoming().status in ['active', 'fulfilled', 'closed']
+          && isValidBuyRequest(incoming())
+          && incoming().updatedAt == request.time)
+        ||
+        // Admin overrides
+        (isAdmin() && incoming().updatedAt == request.time)
+      );
+
+      allow delete: if isVerified() && (request.auth.uid == existing().requesterId || isAdmin());
+    }
+
+    // === CHAT ROOMS ===
+    function isValidChatRoom(data) {
+      return data.keys().hasAll(['participants', 'updatedAt'])
+        && data.participants is list && data.participants.size() == 2
+        && data.updatedAt is timestamp
+        && (!data.keys().hasAny(['productId']) || data.productId is string)
+        && (!data.keys().hasAny(['type']) || data.type in ['dm', 'product']);
+    }
+
+    function isValidMessageImage(img) {
+      return img is string
+        ? img.size() <= 2000
+        : (img is map
+            && img.keys().hasAll(['url'])
+            && img.url is string && img.url.size() <= 2000
+            && (!img.keys().hasAny(['w']) || img.w is number)
+            && (!img.keys().hasAny(['h']) || img.h is number));
+    }
+
+    function isValidMessageVideo(vid) {
+      return vid is map
+        && vid.keys().hasAll(['url'])
+        && vid.url is string && vid.url.size() <= 2000
+        && (!vid.keys().hasAny(['poster']) || (vid.poster is string && vid.poster.size() <= 2000))
+        && (!vid.keys().hasAny(['w']) || vid.w is number)
+        && (!vid.keys().hasAny(['h']) || vid.h is number)
+        && (!vid.keys().hasAny(['duration']) || vid.duration is number);
+    }
+
+    function isValidMessageFile(f) {
+      return f is map
+        && f.keys().hasAll(['url', 'name'])
+        && f.url is string && f.url.size() <= 2000
+        && f.name is string && f.name.size() <= 500
+        && (!f.keys().hasAny(['size']) || f.size is number)
+        && (!f.keys().hasAny(['mime']) || (f.mime is string && f.mime.size() <= 200))
+        && (!f.keys().hasAny(['pages']) || f.pages is number);
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['senderId', 'createdAt'])
+        && (data.keys().hasAny(['text', 'image', 'sharedPost', 'postId', 'audioUrl', 'video', 'file']))
+        && (!data.keys().hasAny(['text']) || (data.text is string && data.text.size() <= 2000))
+        && (!data.keys().hasAny(['image']) || isValidMessageImage(data.image))
+        && (!data.keys().hasAny(['sharedPost']) || (data.sharedPost is map))
+        && (!data.keys().hasAny(['postId']) || (data.postId is string))
+        && (!data.keys().hasAny(['audioUrl']) || (data.audioUrl is string && data.audioUrl.size() <= 2000))
+        && (!data.keys().hasAny(['video']) || isValidMessageVideo(data.video))
+        && (!data.keys().hasAny(['file']) || isValidMessageFile(data.file))
+        && (!data.keys().hasAny(['type']) || (data.type in ['text', 'voice', 'video', 'file']))
+        && (!data.keys().hasAny(['forwardedFrom']) || (data.forwardedFrom is map && data.forwardedFrom.senderId is string));
+    }
+
+    match /chatRooms/{roomId} {
+      // get: only participants can fetch a specific chat room by ID
+      allow get: if canAccessRoom(resource.data);
+      allow list: if isSignedIn() && request.auth.uid in resource.data.participants;
+      
+      allow create: if isVerified() 
+        && isValidId(roomId)
+        && request.auth.uid in incoming().participants
+        && isValidChatRoom(incoming())
+        && !hasBlockRelationship(request.auth.uid, otherParticipant(incoming().participants));
+        
+      allow update: if isAdmin()
+        || (isSignedIn()
+          && isValidId(roomId)
+          && canAccessRoom(existing())
+          && incoming().diff(existing()).affectedKeys().hasOnly(['lastMessage', 'lastSenderId', 'updatedAt', 'pinnedMessageId', 'pinnedMessageText', 'unreadBy', 'status', 'requestedBy', 'mutedBy', 'archivedBy', 'pinnedBy', 'deletedBy', 'lastMessageType', 'typingUsers' ]));
+
+      allow delete: if isVerified() && isValidId(roomId)
+        && request.auth.uid in existing().participants
+        && canAccessRoom(existing())
+        && existing().get('status', '') == 'pending';
+
+      match /messages/{messageId} {
+        allow get: if canAccessRoom(get(/databases/$(database)/documents/chatRooms/$(roomId)).data);
+        allow list: if canAccessRoom(get(/databases/$(database)/documents/chatRooms/$(roomId)).data);
+        allow create: if isVerified() 
+          && isValidId(messageId)
+          && request.auth.uid == incoming().senderId
+          && canAccessRoom(get(/databases/$(database)/documents/chatRooms/$(roomId)).data)
+          && isValidMessage(incoming())
+          && incoming().createdAt == request.time;
+          
+        allow update: if isVerified() 
+          && isValidId(messageId)
+          && request.auth.uid in get(/databases/$(database)/documents/chatRooms/$(roomId)).data.participants
+          && canAccessRoom(get(/databases/$(database)/documents/chatRooms/$(roomId)).data)
+          && (
+             incoming().diff(existing()).affectedKeys().hasOnly(['deletedFor'])
+             ||
+             (canAccessRoom(get(/databases/$(database)/documents/chatRooms/$(roomId)).data)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['isDeletedForEveryone', 'text', 'image', 'video', 'file', 'audioUrl'])
+              && request.auth.uid == existing().senderId)
+              ||
+             (canAccessRoom(get(/databases/$(database)/documents/chatRooms/$(roomId)).data)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['reactions']))
+              ||
+             // Read receipt: any participant may add ONLY themselves to readBy —
+             // superset of the old array + self (can't clear or forge others).
+             (incoming().diff(existing()).affectedKeys().hasOnly(['readBy'])
+              && incoming().readBy is list
+              && incoming().readBy.hasAll(existing().get('readBy', []))
+              && request.auth.uid in incoming().readBy)
+          );
+
+        allow delete: if isVerified()
+          && request.auth.uid in get(/databases/$(database)/documents/chatRooms/$(roomId)).data.participants
+          && canAccessRoom(get(/databases/$(database)/documents/chatRooms/$(roomId)).data)
+          && get(/databases/$(database)/documents/chatRooms/$(roomId)).data.get('status', '') == 'pending';
+      }
+    }
+
+    function clubDoc(clubId) {
+      return /databases/$(database)/documents/clubs/$(clubId);
+    }
+    function isClubLeadOrCo(clubId) {
+      return request.auth.uid == get(clubDoc(clubId)).data.leadId
+        || request.auth.uid in get(clubDoc(clubId)).data.get('coLeadIds', []);
+    }
+    function clubAllowsPost(clubId) {
+      return !get(clubDoc(clubId)).data.get('settings', {}).get('onlyLeadsCanPost', false)
+        || isClubLeadOrCo(clubId);
+    }
+
+    // === CLUBS (Group Chats) ===
+    match /clubs/{clubId} {
+      // Anyone signed in can read public clubs; members can read private clubs
+      allow get: if isSignedIn() && (resource.data.type == 'public' || request.auth.uid in resource.data.memberIds);
+      // list: allow signed-in users — client queries filter appropriately
+      allow list: if isSignedIn();
+
+      // Create: verified user, must be lead and first member
+      allow create: if isVerified()
+        && incoming().leadId == request.auth.uid
+        && request.auth.uid in incoming().memberIds
+        && incoming().name is string && incoming().name.size() > 0 && incoming().name.size() <= 100
+        && incoming().type in ['public', 'private']
+        && incoming().inviteCode is string && incoming().inviteCode.size() > 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      // Update: scoped by role. Previously ANY member could rewrite ANY field,
+      // allowing club takeover (changing leadId/inviteCode/type) and tampering
+      // with other members. Now leads/co-leads manage the club; members may only
+      // post message previews, leave (removing only themselves), or join.
+      allow update: if isVerified() && isValidId(clubId)
+        && (incoming().updatedAt == request.time || incoming().updatedAt == existing().updatedAt)
+        && (
+          // Lead or co-lead: full management (rename, settings, roles, invite
+          // code, add/remove members, transfer leadership)
+          (request.auth.uid == existing().leadId || request.auth.uid in existing().get('coLeadIds', []))
+          ||
+          // Member: update last-message preview / pinned message / unread badge
+          (request.auth.uid in existing().memberIds
+            && incoming().diff(existing()).affectedKeys().hasOnly(['lastMessage', 'lastSenderId', 'lastSenderName', 'pinnedMessageId', 'pinnedMessageText', 'updatedAt', 'unreadBy']))
+          ||
+          // Member: toggle own per-user conversation state (mute/archive/pin/
+          // unread/delete). Only these array fields, and updatedAt must NOT
+          // change — bumping it would reorder every member's inbox.
+          (request.auth.uid in existing().memberIds
+            && incoming().diff(existing()).affectedKeys().hasOnly(['mutedBy', 'archivedBy', 'pinnedBy', 'unreadBy', 'deletedBy'])
+            && incoming().updatedAt == existing().updatedAt)
+          ||
+          // Member: write live typing state (Phase 5). Only typingUsers, and
+          // updatedAt must NOT change (typing must never reorder the inbox).
+          (request.auth.uid in existing().memberIds
+            && incoming().diff(existing()).affectedKeys().hasOnly(['typingUsers'])
+            && incoming().updatedAt == existing().updatedAt)
+          ||
+          // Member: leave the club — may remove only themselves
+          (request.auth.uid in existing().memberIds
+            && incoming().diff(existing()).affectedKeys().hasOnly(['memberIds', 'coLeadIds', 'memberCount', 'updatedAt'])
+            && !(request.auth.uid in incoming().memberIds)
+            && existing().memberIds.hasAll(incoming().memberIds)
+            && incoming().memberIds.size() == existing().memberIds.size() - 1)
+          ||
+          // Non-member: join — may add only themselves, cannot drop existing members
+          (!(request.auth.uid in existing().memberIds)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['memberIds', 'memberCount', 'updatedAt'])
+            && request.auth.uid in incoming().memberIds
+            && incoming().memberIds.hasAll(existing().memberIds)
+            && incoming().memberIds.size() == existing().memberIds.size() + 1)
+        );
+
+      // Delete: lead only
+      allow delete: if isVerified() && request.auth.uid == existing().leadId;
+
+      // Club messages
+      match /messages/{messageId} {
+        allow list: if isSignedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/clubs/$(clubId)).data.memberIds;
+
+        allow create: if isVerified()
+          && request.auth.uid == incoming().senderId
+          && request.auth.uid in get(/databases/$(database)/documents/clubs/$(clubId)).data.memberIds
+          && incoming().createdAt == request.time
+          && clubAllowsPost(clubId)
+          && isValidMessage(incoming());
+
+        // Previously any member could overwrite ANY field of another member's
+        // message. Now: anyone may toggle deleted-for-self or a reaction, but
+        // only the original sender can delete-for-everyone or edit the body.
+        allow update: if isVerified()
+          && request.auth.uid in get(/databases/$(database)/documents/clubs/$(clubId)).data.memberIds
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['deletedFor'])
+            ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['reactions'])
+            ||
+            (incoming().diff(existing()).affectedKeys().hasOnly(['isDeletedForEveryone', 'text', 'image', 'video', 'file', 'audioUrl'])
+              && request.auth.uid == existing().senderId)
+            ||
+            // Read receipt: any member may add ONLY themselves to readBy —
+            // superset of the old array + self (can't clear or forge others).
+            (incoming().diff(existing()).affectedKeys().hasOnly(['readBy'])
+              && incoming().readBy is list
+              && incoming().readBy.hasAll(existing().get('readBy', []))
+              && request.auth.uid in incoming().readBy)
+          );
+      }
+    }
+
+
+    // === WISHLISTS ===
+    match /wishlists/{wishlistId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn()
+        && incoming().userId == request.auth.uid
+        && incoming().productId is string
+        && incoming().productId.size() > 0
+        && exists(productDoc(incoming().productId))
+        && canAccessProduct(get(productDoc(incoming().productId)).data);
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // === REVIEWS ===
+    match /reviews/{reviewId} {
+      allow get: if canAccessReview(resource.data);
+      allow list: if canAccessReview(resource.data);
+      allow write: if false;
+    }
+
+    // === LINK PREVIEWS (chat) ===
+    // Server-side cache of OpenGraph previews. Any signed-in user may read a
+    // cached preview; only the getLinkPreview Cloud Function (admin SDK, which
+    // bypasses rules) writes them.
+    match /linkPreviews/{urlHash} {
+      allow get: if isSignedIn();
+      allow list, write: if false;
+    }
+
+    // === NOTIFICATIONS ===
+    match /notifications/{notifId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      // list: allow signed-in users — client query always filters by
+      // `where('userId', '==', user.uid)` so only own notifications are returned.
+      // resource.data is not available on list queries in security rules.
+      allow list: if isSignedIn();
+
+      // Notification creation is server-side only (via Cloud Functions) to prevent client-side spamming.
+      allow create: if false;
+
+      allow update: if isSignedIn()
+        && resource.data.userId == request.auth.uid
+        && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // === POSTS (COMMUNITY) ===
+    function isValidPost(data) {
+      return data.keys().hasAll(['title', 'content', 'type', 'school', 'authorId', 'authorName', 'status', 'createdAt', 'updatedAt'])
+        && data.title is string && data.title.size() >= 0 && data.title.size() <= 200
+        && data.content is string && data.content.size() >= 0 && data.content.size() <= 5000
+        && data.type is string && data.type in ['info', 'notes', 'event', 'others', 'confession']
+        && data.school is string && data.school.size() > 0
+        && data.authorId is string && data.authorId.size() > 0
+        && data.authorName is string && data.authorName.size() > 0
+        && data.status is string && data.status in ['pending', 'approved', 'rejected']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (!data.keys().hasAny(['city']) || (data.city == null || data.city is string))
+        && (!data.keys().hasAny(['upvotesCount']) || (data.upvotesCount is number))
+        && (!data.keys().hasAny(['downvotesCount']) || (data.downvotesCount is number))
+        && (!data.keys().hasAny(['repliesCount']) || (data.repliesCount is number))
+        && (!data.keys().hasAny(['imageUrl']) || (data.imageUrl is string))
+        && (!data.keys().hasAny(['imageUrls']) || (data.imageUrls is list))
+        && (!data.keys().hasAny(['privacy']) || (data.privacy in ['public', 'private']))
+        && (!data.keys().hasAny(['isAnonymous']) || (data.isAnonymous is bool))
+        && (!data.keys().hasAny(['personaName']) || (data.personaName == null || data.personaName is string))
+        && (!data.keys().hasAny(['authorProfilePicture']) || (data.authorProfilePicture == null || data.authorProfilePicture is string))
+        && (!data.keys().hasAny(['reactionsCount']) || (data.reactionsCount == null || data.reactionsCount is map))
+        && (!data.keys().hasAny(['poll']) || (data.poll == null || data.poll is map));
+    }
+
+    match /posts/{postId} {
+      allow get: if canAccessPost(resource.data);
+      // Public feed/search/profile browsing is served by block-aware callables.
+      // Direct list remains only for admins and a user's own profile posts.
+      allow list: if isSignedIn()
+        && (isAdmin()
+          || request.auth.uid == resource.data.authorId
+          || resource.data.status == 'approved');
+
+      // Moderation is server-owned. A client may only submit `pending`; `approved` is written by the
+      // `submitPost` callable and the `moderatePost` trigger, which use the Admin SDK and therefore
+      // bypass these rules. Accepting `approved` here made the client the approval authority: a
+      // modified app could publish unmoderated content, and the document was already listable in the
+      // feed between the write and the trigger's demotion.
+      allow create: if isVerified()
+        && isValidId(postId)
+        && request.auth.uid == incoming().authorId
+        && isValidPost(incoming())
+        && !incoming().keys().hasAny(['searchTokens', 'searchTokensUpdatedAt', 'trendingBadge', 'moderationFlagged', 'moderationReason'])
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerified() && isValidId(postId) && (
+        // Author updates post content
+        (request.auth.uid == existing().authorId
+          && incoming().status == existing().status
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'content', 'type', 'city', 'privacy', 'updatedAt'])
+          && incoming().updatedAt == request.time)
+        ||
+        // Any verified user can update vote/reply counts, reactions, and poll votes.
+        // Numeric counters may only move by +/-1 per write so they cannot be set to
+        // arbitrary values (e.g. upvotesCount = 1000000). Non-numeric or absent values
+        // make the arithmetic fail and the rule denies.
+        // NOTE: the `reactionsCount` and `poll` maps are still fully rewritable here
+        // and need a server-side/transactional guard — see thingstofix.md 8.6 / 5.1.
+        (incoming().diff(existing()).affectedKeys().hasOnly(['upvotesCount', 'downvotesCount', 'repliesCount', 'reactionsCount', 'poll', 'updatedAt'])
+          && canAccessPost(existing())
+          && !hasBlockRelationship(request.auth.uid, existing().authorId)
+          && (incoming().get('upvotesCount', 0) - existing().get('upvotesCount', 0)) >= -1
+          && (incoming().get('upvotesCount', 0) - existing().get('upvotesCount', 0)) <= 1
+          && (incoming().get('downvotesCount', 0) - existing().get('downvotesCount', 0)) >= -1
+          && (incoming().get('downvotesCount', 0) - existing().get('downvotesCount', 0)) <= 1
+          && (incoming().get('repliesCount', 0) - existing().get('repliesCount', 0)) >= -1
+          && (incoming().get('repliesCount', 0) - existing().get('repliesCount', 0)) <= 1)
+        ||
+        (isAdmin() && incoming().updatedAt == request.time)
+      );
+
+      allow delete: if isVerified() && isValidId(postId) && (request.auth.uid == existing().authorId || isAdmin());
+    }
+
+    // === POST UPVOTES ===
+    match /post_upvotes/{upvoteId} {
+      allow get, list: if isSignedIn();
+      allow create: if isVerified()
+        && incoming().userId == request.auth.uid
+        && canInteractWithPost(incoming().postId);
+      allow delete: if isVerified() && (resource.data.userId == request.auth.uid || get(/databases/$(database)/documents/posts/$(resource.data.postId)).data.authorId == request.auth.uid || isAdmin());
+    }
+
+    // === POST DOWNVOTES ===
+    match /post_downvotes/{downvoteId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isVerified()
+        && incoming().userId == request.auth.uid
+        && canInteractWithPost(incoming().postId);
+      allow delete: if isVerified() && (resource.data.userId == request.auth.uid || get(/databases/$(database)/documents/posts/$(resource.data.postId)).data.authorId == request.auth.uid || isAdmin());
+    }
+
+    // === REPLY UPVOTES ===
+    match /reply_upvotes/{upvoteId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isVerified()
+        && incoming().userId == request.auth.uid
+        && incoming().replyId is string
+        && exists(replyDoc(incoming().replyId))
+        && canAccessReply(get(replyDoc(incoming().replyId)).data);
+      allow delete: if isVerified() && (resource.data.userId == request.auth.uid || get(/databases/$(database)/documents/post_replies/$(resource.data.replyId)).data.authorId == request.auth.uid || isAdmin());
+    }
+
+    // === SAVED POSTS ===
+    match /saved_posts/{saveId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn()
+        && incoming().userId == request.auth.uid
+        && canInteractWithPost(incoming().postId);
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // === POST REACTIONS (CONFESSIONS) ===
+    match /post_reactions/{reactionId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isVerified() 
+        && incoming().userId == request.auth.uid 
+        && canInteractWithPost(incoming().postId)
+        && incoming().reaction is string
+        && incoming().createdAt == request.time;
+      allow update: if isVerified() 
+        && resource.data.userId == request.auth.uid 
+        && canInteractWithPost(resource.data.postId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['reaction', 'updatedAt'])
+        && incoming().updatedAt == request.time;
+      allow delete: if isVerified() && (resource.data.userId == request.auth.uid || get(/databases/$(database)/documents/posts/$(resource.data.postId)).data.authorId == request.auth.uid || isAdmin());
+    }
+
+    // === POST REPLIES ===
+    match /post_replies/{replyId} {
+      allow get: if canAccessReply(resource.data);
+      allow list: if canAccessReply(resource.data);
+      allow create: if isVerified() 
+        && incoming().postId is string
+        && canInteractWithPost(incoming().postId)
+        && incoming().authorId == request.auth.uid
+        && incoming().authorName is string
+        && incoming().authorSchool is string
+        && incoming().content is string
+        && incoming().content.size() > 0 && incoming().content.size() <= 1000
+        && (!incoming().keys().hasAny(['parentId']) || (incoming().parentId == null || incoming().parentId is string))
+        && canReplyToParent(incoming())
+        && (!incoming().keys().hasAny(['upvotesCount']) || (incoming().upvotesCount is number))
+        && (!incoming().keys().hasAny(['repliesCount']) || (incoming().repliesCount is number))
+        && incoming().createdAt == request.time;
+        allow update: if isVerified() && (
+          (canAccessReply(existing())
+            && incoming().diff(existing()).affectedKeys().hasOnly(['upvotesCount', 'repliesCount', 'updatedAt']))
+          ||
+          (resource.data.authorId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['content', 'edited', 'updatedAt'])
+            && incoming().content is string
+            && incoming().content.size() > 0 && incoming().content.size() <= 1000
+            && incoming().edited == true
+            && incoming().updatedAt == request.time)
+        );
+      allow delete: if isVerified() && (resource.data.authorId == request.auth.uid || get(/databases/$(database)/documents/posts/$(resource.data.postId)).data.authorId == request.auth.uid || isAdmin());
+    }
+
+
+
+    // === FOLLOWS ===
+    match /follows/{followId} {
+      allow get: if canAccessFollow(resource.data);
+      // list: isSignedIn() avoids per-doc exists() calls that exceed the 10-call
+      // Firestore limit when many follow docs are returned. Client queries are
+      // already scoped to specific followerId/followingId. Block filtering is
+      // handled client-side.
+      allow list: if isSignedIn();
+      
+      allow create: if isVerified()
+        && isValidId(followId)
+        && incoming().followerId == request.auth.uid
+        && incoming().followerId is string
+        && incoming().followingId is string
+        && incoming().followingId.size() > 0
+        && incoming().followerId != incoming().followingId
+        && canInteractWithUser(incoming().followingId)
+        && incoming().createdAt == request.time;
+      
+      allow delete: if isVerified()
+        && (resource.data.followerId == request.auth.uid
+          || (resource.data.followingId == request.auth.uid
+            && exists(blockDoc(request.auth.uid, resource.data.followerId)))
+          || isAdmin());
+    }
+
+    // === STORIES ===
+    match /stories/{storyId} {
+      // Tray/list queries are scoped to authorId in {self + followees}, so every
+      // matched doc passes canViewStory. Public stories short-circuit before any
+      // exists() call, keeping list within Firestore's per-query lookup limit.
+      allow get: if canViewStory(resource.data);
+      // list (tray / batch queries): resource.data is null during query evaluation
+      // in Firestore rules, so per-doc checks cannot run. The client already scopes
+      // all story queries to authorId in [self, ...followingIds], so signing-in is
+      // sufficient — the server-side authorId filter provides the real restriction.
+      allow list: if isSignedIn();
+
+      allow create: if isVerified() && isValidStoryCreate(incoming(), storyId);
+
+      // Owner may edit only status/privacy/layers; media + provenance are immutable.
+      allow update: if isVerified()
+        && existing().authorId == request.auth.uid
+        && incoming().authorId == existing().authorId
+        && incoming().createdAt == existing().createdAt
+        && incoming().mediaPath == existing().mediaPath
+        && incoming().mediaUrl == existing().mediaUrl
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'privacy', 'layers'])
+        && incoming().status in ['active', 'removed']
+        && incoming().privacy in ['public', 'followers', 'closeFriends']
+        && incoming().layers is list && incoming().layers.size() <= 30;
+
+      allow delete: if isVerified()
+        && (existing().authorId == request.auth.uid || isAdmin());
+
+      // Per-viewer view records. Doc id IS the viewer uid → once-per-viewer dedup.
+      match /views/{viewerId} {
+        allow get: if isSignedIn()
+          && (viewerId == request.auth.uid
+            || (exists(storyDoc(storyId)) && get(storyDoc(storyId)).data.authorId == request.auth.uid));
+        // Owner-only list of viewers.
+        allow list: if isSignedIn()
+          && exists(storyDoc(storyId))
+          && get(storyDoc(storyId)).data.authorId == request.auth.uid;
+
+        allow create: if isVerified()
+          && viewerId == request.auth.uid
+          && exists(storyDoc(storyId))
+          && get(storyDoc(storyId)).data.authorId != request.auth.uid
+          && canViewStory(get(storyDoc(storyId)).data)
+          && incoming().keys().hasOnly(['viewerId', 'firstViewedAt', 'lastViewedAt'])
+          && incoming().viewerId == request.auth.uid
+          && incoming().firstViewedAt == request.time
+          && incoming().lastViewedAt == request.time;
+
+        allow update: if isVerified()
+          && viewerId == request.auth.uid
+          && incoming().diff(existing()).affectedKeys().hasOnly(['lastViewedAt'])
+          && incoming().lastViewedAt == request.time;
+      }
+
+      // Per-viewer like records. Doc id IS the liker uid → one like per user.
+      match /likes/{userId} {
+        allow get: if isSignedIn();
+        allow list: if isSignedIn();
+
+        allow create: if isVerified()
+          && userId == request.auth.uid
+          && exists(storyDoc(storyId))
+          && incoming().keys().hasOnly(['userId', 'createdAt'])
+          && incoming().userId == request.auth.uid
+          && incoming().createdAt == request.time;
+
+        allow delete: if isVerified()
+          && userId == request.auth.uid;
+      }
+
+      // Story replies — viewers can send text replies to the story owner.
+      match /replies/{replyId} {
+        allow get, list: if isSignedIn()
+          && exists(storyDoc(storyId))
+          && (get(storyDoc(storyId)).data.authorId == request.auth.uid
+              || incoming().authorId == request.auth.uid);
+
+        allow create: if isVerified()
+          && exists(storyDoc(storyId))
+          && incoming().keys().hasOnly(['storyId', 'authorId', 'authorUsername', 'content', 'createdAt'])
+          && incoming().authorId == request.auth.uid
+          && incoming().storyId == storyId
+          && incoming().content is string && incoming().content.size() > 0 && incoming().content.size() <= 500
+          && incoming().createdAt == request.time;
+      }
+    }
+
+    // === FOLLOW EDGES ===
+    // Deterministic mirror of `follows` (auto-ID docs can't be path-looked-up in rules).
+    // Written exclusively by the admin-SDK `mirrorFollowEdge` Cloud Function.
+    match /follow_edges/{edgeId} {
+      allow get, list: if isSignedIn()
+        && (resource.data.followerId == request.auth.uid
+          || resource.data.followingId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // Server-materialized caches. Public landing stats remain readable before
+    // sign-in; all personalized/school aggregates require authentication.
+    match /computed/{documentId} {
+      allow get: if documentId == 'landing_stats' || isSignedIn();
+      allow list: if isSignedIn();
+      allow write: if false;
+    }
+
+    match /user_affinity/{userId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow write: if false;
+    }
+
+    // === SCHOOL REQUESTS ===
+    function isValidSchoolRequest(data) {
+      return data.keys().hasAll(['schoolName', 'city', 'website', 'idCardUrl', 'requesterName', 'requesterEmail', 'status', 'createdAt'])
+        && data.schoolName is string && data.schoolName.size() > 0
+        && data.city is string && data.city.size() > 0
+        && data.website is string && data.website.size() > 0
+        && data.idCardUrl is string && data.idCardUrl.size() > 0
+        && data.requesterName is string && data.requesterName.size() > 0
+        && data.requesterEmail is string && data.requesterEmail.size() > 0
+        && data.status is string && data.status in ['pending', 'approved', 'rejected']
+        && data.createdAt is timestamp;
+    }
+
+    match /school_requests/{requestId} {
+      allow read: if isAdmin();
+      
+      // Allow unauthenticated create since this happens during signup
+      allow create: if isValidId(requestId)
+        && isValidSchoolRequest(incoming())
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time;
+
+      allow update: if isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
+      allow delete: if isAdmin();
+    }
+
+    // === SCHOOLS ===
+    match /schools/{schoolId} {
+      allow read: if true;
+      
+      allow create: if isAdmin()
+        && incoming().name is string
+        && incoming().name.size() > 0
+        && incoming().createdAt == request.time;
+        
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    // === BLOCKS ===
+    match /blocks/{blockId} {
+      allow get: if isSignedIn()
+        && (blockId.matches('^' + request.auth.uid + '_[a-zA-Z0-9_\\-]+$')
+          || blockId.matches('^[a-zA-Z0-9_\\-]+_' + request.auth.uid + '$'));
+      allow list: if isSignedIn()
+        && (resource.data.blockerId == request.auth.uid || resource.data.blockedId == request.auth.uid);
+      allow create: if isVerified() 
+        && incoming().keys().hasOnly(['blockerId', 'blockedId', 'createdAt'])
+        && incoming().blockerId == request.auth.uid
+        && incoming().blockedId is string
+        && isValidId(incoming().blockedId)
+        && incoming().blockedId != request.auth.uid
+        && blockId == request.auth.uid + '_' + incoming().blockedId
+        && incoming().createdAt == request.time;
+      allow delete: if isVerified() && resource.data.blockerId == request.auth.uid;
+    }
+
+    // === REPORTS ===
+    match /reports/{reportId} {
+      allow read: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if isVerified()
+        && incoming().reporterId == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time;
+      // Only an admin may resolve/dismiss or remove a report: the moderation decision is not a
+      // client-writable field, and a reporter cannot retract evidence of their own report.
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // === ACCOUNT DELETION (server-owned) ===
+    // `requestAccountDeletion` writes this document with the Admin SDK. Clients may only read the
+    // status of their own request; no client can create, modify or clear one.
+    match /deletionRequests/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+
+    // === USERNAMES ===
+    match /usernames/{username} {
+      allow read: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isVerified()
+        && incoming().userId == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow delete: if isVerified() && resource.data.userId == request.auth.uid;
+    }
+  }
+}
