@@ -2,7 +2,7 @@ import { motion } from 'motion/react';
 import { ShieldCheck, XCircle, AlertTriangle, Filter, CheckCircle, Trash2, Ban, ChevronRight, Users, Package, Crown, Eye, RefreshCw, IdCard, Camera, School, FileText, Database, Building2, Globe, Mail, Send, AlertOctagon } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { collection, query, where, getDocs, getDoc, updateDoc, doc, deleteDoc, serverTimestamp, onSnapshot, getCountFromServer, addDoc } from 'firebase/firestore';
+import { collection, query, where, limit, getDocs, getDoc, updateDoc, doc, deleteDoc, serverTimestamp, onSnapshot, getCountFromServer, addDoc } from 'firebase/firestore';
 import { getFunctions, httpsCallable } from 'firebase/functions';
 import { db } from '../../lib/firebase';
 import { handleFirestoreError, OperationType } from '../../lib/firestore-errors';
@@ -10,6 +10,42 @@ import { useAuth } from '../../lib/AuthContext';
 import { useToast } from '../../lib/ToastContext';
 import { getOptimizedImageUrl } from '../../lib/utils';
 import { createNotification } from '../../lib/notifications';
+import type { Query } from 'firebase/firestore';
+
+/** Counts documents server-side; a failed count never blocks the panel. */
+async function countOfDocuments(q: Query): Promise<number> {
+  try {
+    return (await getCountFromServer(q)).data().count;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * School list for the admin dropdowns. Loaded at most once per session: it changes rarely and the
+ * panel used to re-download the whole collection every time it mounted.
+ */
+let adminSchoolsCache: { name: string; city: string }[] | null = null;
+let adminSchoolsRequest: Promise<{ name: string; city: string }[]> | null = null;
+
+async function loadAdminSchools(): Promise<{ name: string; city: string }[]> {
+  if (adminSchoolsCache) return adminSchoolsCache;
+  if (!adminSchoolsRequest) {
+    adminSchoolsRequest = getDocs(query(collection(db, 'schools'), limit(500)))
+      .then(snap => {
+        const schools = snap.docs.map(d => ({
+          name: (d.data().name as string) || d.id,
+          city: (d.data().city as string) || 'Lucknow',
+        }));
+        schools.sort((a, b) => a.name.localeCompare(b.name));
+        adminSchoolsCache = schools;
+        return schools;
+      })
+      .catch(() => [] as { name: string; city: string }[])
+      .finally(() => { adminSchoolsRequest = null; });
+  }
+  return adminSchoolsRequest;
+}
 import DOMPurify from 'dompurify';
 
 interface PendingUser { id: string; name: string; school: string; email: string; verified: boolean; isAdmin: boolean; reputation: number; idCardUrl?: string; selfieUrl?: string; verificationStatus?: string; verificationRejectionReason?: string; }
@@ -50,38 +86,31 @@ export default function AdminPanel() {
     if (!userData?.isAdmin) return;
     const fetchStats = async () => {
       try {
-        const [usersSnap, verifiedSnap, productsSnap, pendingProductsSnap, pendingVerificationsSnap, pendingOrgsSnap, pendingSchoolSnap, pendingPostsSnap, pendingReportsSnap] = await Promise.all([
-          getDocs(collection(db, 'users')),
-          getDocs(query(collection(db, 'users'), where('verified', '==', true))),
-          getDocs(collection(db, 'products')),
-          getDocs(query(collection(db, 'products'), where('status', '==', 'pending'))),
-          getDocs(query(collection(db, 'users'), where('verificationStatus', 'in', ['pending', 'flagged_manual']))),
-          getDocs(query(collection(db, 'users'), where('accountType', '==', 'organization'), where('verificationStatus', '==', 'pending'))),
-          getDocs(query(collection(db, 'school_requests'), where('status', '==', 'pending'))),
-          getDocs(query(collection(db, 'posts'), where('status', '==', 'pending'))),
-          getDocs(query(collection(db, 'reports'), where('status', '==', 'pending'))),
+        // Counts use Firestore aggregation: showing a number used to download the entire users
+        // and products collections (twice), which is what made this panel feel slow.
+        const [totalUsers, verifiedUsers, totalProducts, pendingProducts, pendingVerifications, pendingOrgs, pendingSchools, pendingPosts, pendingReports] = await Promise.all([
+          countOfDocuments(query(collection(db, 'users'))),
+          countOfDocuments(query(collection(db, 'users'), where('verified', '==', true))),
+          countOfDocuments(query(collection(db, 'products'))),
+          countOfDocuments(query(collection(db, 'products'), where('status', '==', 'pending'))),
+          countOfDocuments(query(collection(db, 'users'), where('verificationStatus', 'in', ['pending', 'flagged_manual']))),
+          countOfDocuments(query(collection(db, 'users'), where('accountType', '==', 'organization'), where('verificationStatus', '==', 'pending'))),
+          countOfDocuments(query(collection(db, 'school_requests'), where('status', '==', 'pending'))),
+          countOfDocuments(query(collection(db, 'posts'), where('status', '==', 'pending'))),
+          countOfDocuments(query(collection(db, 'reports'), where('status', '==', 'pending'))),
         ]);
 
         const totalPending =
-          pendingProductsSnap.size +
-          pendingVerificationsSnap.size +
-          pendingOrgsSnap.size +
-          pendingSchoolSnap.size +
-          pendingPostsSnap.size +
-          pendingReportsSnap.size;
+          pendingProducts +
+          pendingVerifications +
+          pendingOrgs +
+          pendingSchools +
+          pendingPosts +
+          pendingReports;
 
-        setStats({
-          totalUsers: usersSnap.size, verifiedUsers: verifiedSnap.size,
-          totalProducts: productsSnap.size, totalPending
-        });
-        
-        const schoolsSnap = await getDocs(collection(db, 'schools'));
-        const fetchedSchools = schoolsSnap.docs.map(d => ({
-          name: d.data().name as string,
-          city: d.data().city as string || 'Lucknow'
-        }));
-        fetchedSchools.sort((a, b) => a.name.localeCompare(b.name));
-        setSchools(fetchedSchools);
+        setStats({ totalUsers, verifiedUsers, totalProducts, totalPending });
+
+        setSchools(await loadAdminSchools());
       } catch (err) { console.error(err); }
     };
     fetchStats();

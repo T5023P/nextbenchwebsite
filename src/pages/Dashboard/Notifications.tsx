@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Bell, Check, CheckCheck, ShieldCheck, Package, MessageSquare, Star, Trash2, Crown, ChevronDown, ChevronUp, AtSign, Repeat2 } from 'lucide-react';
 import { useAuth } from '../../lib/AuthContext';
 import { db } from '../../lib/firebase';
-import { collection, query, where, orderBy, onSnapshot, updateDoc, doc, deleteDoc, writeBatch } from 'firebase/firestore';
+import { collection, query, where, orderBy, limit, onSnapshot, updateDoc, doc, deleteDoc, writeBatch } from 'firebase/firestore';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '../../lib/ToastContext';
 import { isChatMessageNotification } from '../../lib/notifications';
@@ -33,6 +33,8 @@ const ICON_MAP: Record<string, React.ReactNode> = {
   mention: <AtSign size={20} className="text-indigo-500" />,
   repost: <Repeat2 size={20} className="text-emerald-500" />,
 };
+
+const NOTIFICATION_PAGE_LIMIT = 200;
 
 export default function Notifications() {
   const { user } = useAuth();
@@ -106,7 +108,9 @@ export default function Notifications() {
     const q = query(
       collection(db, 'notifications'),
       where('userId', '==', user.uid),
-      orderBy('createdAt', 'desc')
+      orderBy('createdAt', 'desc'),
+      // The listener used to stream every notification this account ever received.
+      limit(NOTIFICATION_PAGE_LIMIT)
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {

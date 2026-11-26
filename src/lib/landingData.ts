@@ -1,4 +1,4 @@
-import { collection, getDocs, query, limit } from 'firebase/firestore';
+import { collection, getDocs, query, limit, getCountFromServer } from 'firebase/firestore';
 import { db } from './firebase';
 import { getDiscoveryFeed, getLandingStats as getLandingStatsCallable } from './discovery';
 
@@ -247,8 +247,8 @@ export async function fetchProductCount(): Promise<number> {
 
 export async function fetchSchoolCount(): Promise<number> {
   try {
-    const snap = await getDocs(query(collection(db, 'schools'), limit(1000)));
-    return snap.size;
+    const snap = await getCountFromServer(query(collection(db, 'schools')));
+    return snap.data().count;
   } catch {
     return SEED_SCHOOLS.length;
   }

@@ -1620,39 +1620,45 @@ export const getDiscoveryFeed = onCall({ invoker: "public", cors: CORS_ORIGINS }
   const productCursor = typeof request.data?.productCreatedAt === "number" ? request.data.productCreatedAt : null;
   const cursorIndex = typeof request.data?.cursorIndex === "number" ? request.data.cursorIndex : 0;
 
-  // ─── Following Tab (Strict Chronological Posts from Followed Authors) ───
+  // ─── Following Tab (Chronological Posts from Followed Authors) ───
   if (mode === "following") {
     if (!uid) return { posts: [], products: [], hasMorePosts: false, hasMoreProducts: false, nextCursor: {} };
-    
-    // Get followed users
+
     const followingSnap = await db.collection("follows").where("followerId", "==", uid).limit(100).get();
     const followingIds = followingSnap.docs.map((docSnap) => docSnap.get("followingId")).filter((id): id is string => typeof id === "string");
-    
+
     if (followingIds.length === 0) {
       return { posts: [], products: [], hasMorePosts: false, hasMoreProducts: false, nextCursor: {} };
     }
 
-    let queryRef = db.collection("posts")
+    // Equality-only query on purpose. Adding `orderBy("createdAt")` made Firestore demand a
+    // composite (authorId, status, createdAt) index this project never created, so the callable
+    // failed with FAILED_PRECONDITION and the Following tab showed an error instead of posts.
+    // Ordering and paging happen in memory over a bounded, already-filtered window.
+    const FOLLOWING_PAGE_SIZE = 20;
+    const FOLLOWING_SCAN_SIZE = 100;
+    const snap = await db.collection("posts")
       .where("authorId", "in", followingIds.slice(0, 30))
       .where("status", "==", "approved")
-      .orderBy("createdAt", "desc")
-      .limit(20);
+      .limit(FOLLOWING_SCAN_SIZE)
+      .get();
 
-    if (postCursor) {
-      queryRef = queryRef.startAfter(admin.firestore.Timestamp.fromMillis(postCursor));
-    }
-
-    const snap = await queryRef.get();
-    const visibleDocs = snap.docs.filter((d) => isVisiblePostData(d.data(), uid, blockedIds, friendIds));
-    const posts = await enrichPosts(visibleDocs);
+    const visibleDocs = snap.docs
+      .filter((d) => isVisiblePostData(d.data(), uid, blockedIds, friendIds))
+      .sort((a, b) => docMillis(b, "createdAt") - docMillis(a, "createdAt"));
+    const remaining = postCursor
+      ? visibleDocs.filter((d) => docMillis(d, "createdAt") < postCursor)
+      : visibleDocs;
+    const pageDocs = remaining.slice(0, FOLLOWING_PAGE_SIZE);
+    const posts = await enrichPosts(pageDocs);
 
     return {
       posts,
       products: [],
-      hasMorePosts: snap.size === 20,
+      hasMorePosts: remaining.length > FOLLOWING_PAGE_SIZE,
       hasMoreProducts: false,
       nextCursor: {
-        postCreatedAt: snap.docs.length ? docMillis(snap.docs[snap.docs.length - 1], "createdAt") : undefined,
+        postCreatedAt: pageDocs.length ? docMillis(pageDocs[pageDocs.length - 1], "createdAt") : undefined,
       },
     };
   }
@@ -1842,6 +1848,17 @@ export const searchDiscovery = onCall({ invoker: "public", cors: CORS_ORIGINS },
       .where("username", ">=", username)
       .where("username", "<=", `${username}\uf8ff`)
       .limit(40);
+  } else if (term) {
+    // People are looked up by name across campuses. The old query only ever saw the first 120
+    // users of the viewer's own school, so a real person outside that window could never be
+    // found. A name prefix range uses the automatic single-field index: no composite index and
+    // no dependence on the viewer's school being spelled exactly like the other profile's.
+    const nameTerm = term.split(/\s+/)[0];
+    const namePrefix = nameTerm.charAt(0).toUpperCase() + nameTerm.slice(1);
+    userQuery = db.collection("users")
+      .where("name", ">=", namePrefix)
+      .where("name", "<=", `${namePrefix}\uf8ff`)
+      .limit(60);
   } else if (school) {
     userQuery = db.collection("users").where("school", "==", school).limit(120);
   } else if (city) {
@@ -1860,16 +1877,46 @@ export const searchDiscovery = onCall({ invoker: "public", cors: CORS_ORIGINS },
     ? db.collection("clubs").where("searchTokens", "array-contains", longestToken || term.slice(1)).limit(30)
     : db.collection("clubs").where("type", "==", "public").limit(suggestions ? 5 : 20);
 
-  const [usersSnap, postsSnap, productsSnap, clubsSnap] = await Promise.all([
+  let [usersSnap, postsSnap, productsSnap, clubsSnap] = await Promise.all([
     userQuery.get(),
     postsQuery.get(),
     productsQuery.get(),
     clubsQuery.get(),
   ]);
 
+  // Documents written before the `index*SearchTokens` triggers existed have no `searchTokens`
+  // array, so a token query returns nothing even though the content is there. Each empty group
+  // falls back on its own to a bounded scan, and the per-field text filters below do the matching
+  // that the token query was only a fast path for.
+  if (term) {
+    const [postFallback, productFallback, clubFallback] = await Promise.all([
+      postsSnap.empty
+        ? db.collection("posts").where("status", "==", "approved").limit(300).get()
+        : Promise.resolve(null),
+      productsSnap.empty
+        ? db.collection("products").where("status", "==", "available").limit(200).get()
+        : Promise.resolve(null),
+      clubsSnap.empty
+        ? db.collection("clubs").where("type", "==", "public").limit(100).get()
+        : Promise.resolve(null),
+    ]);
+    if (postFallback) postsSnap = postFallback;
+    if (productFallback) productsSnap = productFallback;
+    if (clubFallback) clubsSnap = clubFallback;
+  }
+
+  // The name range is capitalised, so lower-case profiles can miss it; a bounded scan keeps
+  // people search from silently returning nothing.
+  if (term && usersSnap.empty) {
+    usersSnap = await db.collection("users").limit(200).get();
+  }
+
   const users: PublicUser[] = [];
   usersSnap.forEach((docSnap) => {
-    if (docSnap.id === uid || blockedIds.has(docSnap.id)) return;
+    if (blockedIds.has(docSnap.id)) return;
+    // Suggestions never include the viewer, but an explicit search for your own name should
+    // find your profile instead of reporting "Nothing matched".
+    if (!term && docSnap.id === uid) return;
     const data = docSnap.data();
     if (data.verified !== true) return;
     if (term && !term.startsWith("@") && !matchesSearch(data.name, term) && !matchesSearch(data.username, term) && !matchesSearch(data.school, term)) return;
@@ -2400,29 +2447,6 @@ export const rateLimitMessage = onDocumentCreated(
     const allowed = await enforceRateLimit(uid, 'message', 30, 60000);
     if (!allowed) {
       console.warn(`User ${uid} exceeded message rate limit. Deleting message ${event.params.messageId}.`);
-      await snapshot.ref.delete();
-    }
-  }
-);
-
-export const rateLimitReply = onDocumentCreated(
-  { document: "post_replies/{replyId}" },
-  async (event) => {
-    const snapshot = event.data;
-    if (!snapshot) return;
-
-    const data = snapshot.data();
-    const uid = data.authorId;
-    if (!uid) return;
-
-    // Admin users bypass rate limiting
-    const callerSnap = await db.collection("users").doc(uid).get();
-    if (callerSnap.data()?.isAdmin === true) return;
-
-    // Limit: Max 15 replies per minute
-    const allowed = await enforceRateLimit(uid, 'reply', 15, 60000);
-    if (!allowed) {
-      console.warn(`User ${uid} exceeded reply rate limit. Deleting reply ${event.params.replyId}.`);
       await snapshot.ref.delete();
     }
   }
